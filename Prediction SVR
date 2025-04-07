@@ -1,0 +1,260 @@
+COD SVR
+import numpy as np
+import pandas as pd
+import datetime as dt
+import yfinance as yf
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, mean_squared_error, mean_absolute_error, r2_score
+from scipy.stats import pearsonr
+import optuna
+
+
+stock_symbol = 'BRK-B'
+forecast_date = dt.datetime(2024, 11, 22)
+start_date = forecast_date - dt.timedelta(days=365 * 10)
+future_days = 15
+horizons = [1, 2, 3, 5, 7, 10, 15, 20]
+horizon_to_results = {}
+lookback = 20
+window_years = 2
+window_days = window_years * 365
+data = yf.download(stock_symbol, start=start_date, end=forecast_date + dt.timedelta(days=future_days))
+data = data[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
+data['Returns'] = data['Close'].pct_change()
+data['SMA_10'] = data['Close'].rolling(10).mean()
+data['SMA_50'] = data['Close'].rolling(50).mean()
+data['SMA_200'] = data['Close'].rolling(200).mean()
+data['Volatility_20d'] = data['Returns'].rolling(20).std()
+window_rsi = 14
+delta = data['Close'].diff()
+gain = delta.where(delta > 0, 0).rolling(window_rsi).mean()
+loss = (-delta.where(delta < 0, 0)).rolling(window_rsi).mean()
+rs = gain / loss
+data['RSI'] = 100 - (100 / (1 + rs))
+ema12 = data['Close'].ewm(span=12, adjust=False).mean()
+ema26 = data['Close'].ewm(span=26, adjust=False).mean()
+data['MACD'] = ema12 - ema26
+bb_window = 20
+rolling_mean = data['Close'].rolling(bb_window).mean()
+rolling_std = data['Close'].rolling(bb_window).std()
+data['BB_Upper'] = rolling_mean + 2 * rolling_std
+data['BB_Lower'] = rolling_mean - 2 * rolling_std
+data['BB_Mid'] = rolling_mean
+data['OBV'] = (np.sign(data['Close'].diff()) * data['Volume']).fillna(0).cumsum()
+date_range = pd.date_range(start=start_date, end=forecast_date + dt.timedelta(days=future_days), freq='B')
+num_days = len(date_range)
+industry_pe_series = 20 + np.random.normal(0, 0.01, num_days).cumsum()
+industry_pe_df = pd.DataFrame({'Date': date_range, 'Industry_PE': industry_pe_series}).set_index('Date')
+data_length = len(data)
+stock_pe_series = 25 + np.random.normal(0, 0.01, data_length).cumsum()
+data['PE_Ratio'] = stock_pe_series
+data = data.join(industry_pe_df, how='left')
+data = data.ffill()
+data['Valuation_Diff'] = data['PE_Ratio'] - data['Industry_PE']
+data = data.dropna()
+def create_features(df, horizon, lookback):
+  future_prices = pd.concat([df['Close'].shift(-i) for i in range(1, horizon + 1)], axis=1)
+  future_avg = future_prices.mean(axis=1)
+  df['Direction'] = (future_avg > df['Close']).astype(int)
+  df = df.dropna()
+  features = ['Close', 'SMA_10', 'SMA_50', 'SMA_200', 'Volatility_20d',
+              'RSI', 'MACD', 'BB_Upper', 'BB_Lower', 'BB_Mid', 'OBV', 'Valuation_Diff']
+  X_list, y_list = [], []
+  for i in range(lookback, len(df)):
+      if pd.isna(df['Direction'].iloc[i]):
+          continue
+      row_features = []
+      past_closes = df['Close'].values[i - lookback:i]
+      current_indicators = df[features].iloc[i].values
+      f_row = np.concatenate([past_closes, current_indicators])
+      X_list.append(f_row)
+      y_list.append(df['Direction'].iloc[i])
+  X_all = np.array(X_list)
+  y_all = np.array(y_list)
+  valid_indices = np.arange(lookback, len(df))
+  data_for_XY = df.iloc[valid_indices].copy()
+  data_for_XY['Date'] = data_for_XY.index
+  data_for_XY.reset_index(drop=True, inplace=True)
+  return X_all, y_all, data_for_XY
+
+
+def evaluate_horizon(horizon):
+  X_all, y_all, data_for_XY = create_features(data.copy(), horizon, lookback)
+  if len(X_all) == 0:
+      return None, None
+  all_dates = data_for_XY['Date']
+  if (all_dates >= pd.to_datetime(forecast_date)).any():
+      current_day_index = np.where(all_dates >= pd.to_datetime(forecast_date))[0][0]
+  else:
+      current_day_index = len(all_dates) - 1
+  train_end = current_day_index
+  test_start = current_day_index
+  test_end = min(current_day_index + future_days, len(X_all))
+  if test_start <= 0 or test_start >= len(X_all):
+      return None, None
+  train_end_date = all_dates.iloc[train_end]
+  train_start_date = train_end_date - dt.timedelta(days=window_days)
+  train_start_idx_candidates = np.where(all_dates >= train_start_date)[0]
+  if len(train_start_idx_candidates) == 0:
+      return None, None
+  train_start_idx = train_start_idx_candidates[0]
+  X_train = X_all[train_start_idx:train_end]
+  y_train = y_all[train_start_idx:train_end]
+  X_test = X_all[test_start:test_end]
+  y_test = y_all[test_start:test_end]
+  if len(X_train) == 0 or len(X_test) == 0:
+      return None, None
+  scaler = StandardScaler()
+  X_train_scaled = scaler.fit_transform(X_train)
+  X_test_scaled = scaler.transform(X_test)
+  def objective(trial):
+      test_size = 0.2
+      split_point = int(len(X_train_scaled) * (1 - test_size))
+      C = trial.suggest_float('C', 0.1, 100, log=True)
+      gamma = trial.suggest_categorical('gamma', ['scale', 'auto'])
+      class_weight = trial.suggest_categorical('class_weight', [None, 'balanced'])
+      model = SVC(kernel='rbf', C=C, gamma=gamma, class_weight=class_weight, random_state=42)
+      model.fit(X_train_scaled[:split_point], y_train[:split_point])
+      y_val_pred = model.predict(X_train_scaled[split_point:])
+      return 1 - accuracy_score(y_train[split_point:], y_val_pred)
+  study = optuna.create_study(direction='minimize')
+  study.optimize(objective, n_trials=10, show_progress_bar=False)
+  best_params = study.best_params
+  model = SVC(kernel='rbf', C=best_params['C'], gamma=best_params['gamma'], class_weight=best_params['class_weight'], random_state=42)
+  model.fit(X_train_scaled, y_train)
+  y_pred = model.predict(X_test_scaled)
+  acc = accuracy_score(y_test, y_pred)
+  f1 = f1_score(y_test, y_pred)
+  unique_classes = np.unique(y_test)
+  if len(unique_classes) < 2:
+      auc = np.nan
+  else:
+      auc = roc_auc_score(y_test, y_pred)
+  if test_start > 0:
+      last_known_price = data_for_XY['Close'].iloc[test_start - 1]
+  else:
+      last_known_price = data_for_XY['Close'].iloc[0]
+  sim_prices = [last_known_price]
+  for pred_dir in y_pred:
+      sim_prices.append(sim_prices[-1] * (1 + 0.005 if pred_dir == 1 else 1 - 0.005))
+  sim_dates = all_dates.iloc[test_start:test_end]
+  actual_next = data[(data.index >= forecast_date) & (data.index <= forecast_date + dt.timedelta(days=future_days))]
+  common_ix = actual_next.index.intersection(sim_dates)
+  if len(common_ix) == 0:
+      return None, None
+  actual_prices = actual_next.loc[common_ix]['Close'].values
+  predicted_prices = np.array(sim_prices[1:len(common_ix) + 1])
+  mse = mean_squared_error(actual_prices, predicted_prices)
+  mae = mean_absolute_error(actual_prices, predicted_prices)
+  rmse = np.sqrt(mse)
+  r2 = r2_score(actual_prices, predicted_prices)
+  mape = np.mean(np.abs((actual_prices - predicted_prices) / actual_prices)) * 100 if np.all(actual_prices != 0) else np.nan
+  if len(actual_prices) > 1 and len(predicted_prices) > 1:
+      corr, _ = pearsonr(actual_prices, predicted_prices)
+  else:
+      corr = np.nan
+  actual_returns = np.diff(actual_prices)
+  predicted_returns = np.diff(predicted_prices)
+  direction_matches = np.sum((actual_returns * predicted_returns) > 0)
+  direction_accuracy = direction_matches / len(actual_returns) if len(actual_returns) > 0 else np.nan
+  if len(actual_next) > 0:
+      start_actual = actual_next['Close'].iloc[0]
+      end_actual = actual_next['Close'].iloc[-1]
+      actual_change_pct = ((end_actual - start_actual) / start_actual) * 100
+  else:
+      start_actual = np.nan
+      end_actual = np.nan
+      actual_change_pct = np.nan
+  if len(sim_prices) > 1:
+      start_pred = sim_prices[1]
+      end_pred = sim_prices[-1]
+      pred_change_pct = ((end_pred - start_pred) / start_pred) * 100
+  else:
+      start_pred = np.nan
+      end_pred = np.nan
+      pred_change_pct = np.nan
+  if not np.isnan(end_actual) and not np.isnan(end_pred):
+      diff_pct = ((end_pred - end_actual) / end_actual) * 100
+  else:
+      diff_pct = np.nan
+  results = {
+      'horizon': horizon,
+      'acc': acc,
+      'f1': f1,
+      'auc': auc,
+      'mse': mse,
+      'mae': mae,
+      'rmse': rmse,
+      'r2': r2,
+      'mape': mape,
+      'corr': corr,
+      'direction_accuracy': direction_accuracy,
+      'start_actual': start_actual,
+      'end_actual': end_actual,
+      'actual_change_pct': actual_change_pct,
+      'start_pred': start_pred,
+      'end_pred': end_pred,
+      'pred_change_pct': pred_change_pct,
+      'diff_pct': diff_pct,
+      'sim_dates': sim_dates,
+      'sim_prices': sim_prices,
+      'actual_next': actual_next,
+      'data_for_XY': data_for_XY
+  }
+  return results, data_for_XY
+
+
+best_r2 = -999
+best_horizon = None
+best_results = None
+for h in horizons:
+  res, df_xy = evaluate_horizon(h)
+  if res is not None:
+      if res['r2'] > best_r2:
+          best_r2 = res['r2']
+          best_horizon = h
+          best_results = res
+if best_results is None:
+  print("No valid results found for any horizon.")
+else:
+  diff_from_perfect = 1 - best_r2
+  print(f"\n=== Best Horizon: {best_horizon} days ===")
+  print(f"R²: {best_r2:.2f}, Difference from perfect (1 - R²): {diff_from_perfect:.2f}")
+  print("\nMetrics on the test (holdout):")
+  print(f"Accuracy: {best_results['acc']:.2f}, F1: {best_results['f1']:.2f}, AUC: {best_results['auc']:.2f}")
+  print("\nError Metrics for price predictions:")
+  print(f"MSE: {best_results['mse']:.2f}")
+  print(f"MAE: {best_results['mae']:.2f}")
+  print(f"RMSE: {best_results['rmse']:.2f}")
+  print(f"R²: {best_results['r2']:.2f}")
+  print(f"MAPE: {best_results['mape']:.2f}%")
+  print(f"Pearson Correlation: {best_results['corr']:.2f}")
+  print(f"Directional Accuracy: {best_results['direction_accuracy']:.2f}")
+  print("\nAdditional Metrics:")
+  print(f"Actual Start Price: {best_results['start_actual']:.2f}, Actual End Price: {best_results['end_actual']:.2f}, Actual % Change: {best_results['actual_change_pct']:.2f}%")
+  print(f"Predicted Start Price: {best_results['start_pred']:.2f}, Predicted End Price: {best_results['end_pred']:.2f}, Predicted % Change: {best_results['pred_change_pct']:.2f}%")
+  print(f"Difference between Actual and Predicted final price: {best_results['diff_pct']:.2f}%")
+  sim_dates = best_results['sim_dates']
+  sim_prices = best_results['sim_prices']
+  actual_next = best_results['actual_next']
+  data_for_XY = best_results['data_for_XY']
+  plot_start_date = forecast_date - dt.timedelta(days=30)
+  data_f = yf.download(stock_symbol, start=start_date, end=forecast_date + dt.timedelta(days=future_days))
+  actual_past = data_f[(data_f.index >= plot_start_date) & (data_f.index < forecast_date)]
+  actual_next_segment = data_f[(data_f.index >= forecast_date) & (data_f.index <= forecast_date + dt.timedelta(days=future_days))]
+  plt.figure(figsize=(14, 7))
+  plt.plot(actual_past.index, actual_past['Close'], label='Actual Prices (Last 30 days)', color='blue')
+  plt.plot(actual_next_segment.index, actual_next_segment['Close'], label='Actual Prices (Next 30 days)', color='green')
+  common_ix = actual_next_segment.index.intersection(sim_dates)
+  if len(common_ix) > 0:
+      num_predictions = len(common_ix)
+      if len(sim_prices) - 1 > num_predictions:
+          sim_prices = sim_prices[:num_predictions + 1]
+      plt.plot(common_ix, sim_prices[1:len(common_ix) + 1], label='Predicted Direction-based Path', color='red', linestyle='--')
+  plt.title(f"Best Horizon for {stock_symbol}: {best_horizon} days\n(Last 30 days actual & Next {future_days} days predicted)")
+  plt.xlabel("Date")
+  plt.ylabel("Price")
+  plt.legend()
+  plt.show()
