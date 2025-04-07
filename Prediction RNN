@@ -1,0 +1,283 @@
+COD RNN
+import numpy as np
+import pandas as pd
+import datetime as dt
+import yfinance as yf
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (accuracy_score, f1_score, mean_squared_error,
+                           mean_absolute_error, r2_score, roc_auc_score)
+from scipy.stats import pearsonr
+from tensorflow.keras import Sequential, Input
+from tensorflow.keras.layers import SimpleRNN, Dense, Dropout
+from tensorflow.keras.optimizers import Adam
+import keras_tuner as kt
+
+
+stocks = ['GOOGL']
+forecast_date = dt.datetime(2024, 11, 22)
+start_date = forecast_date - dt.timedelta(days=365 * 10)
+future_days = 30
+horizons = [1, 2, 3, 5, 7, 10, 15, 20, 25, 30]
+lookback = 20
+window_years = 2
+window_days = window_years * 365
+EPOCHS = 32
+BATCH_SIZE = 32
+
+
+def create_dataset(df, horizon, lookback):
+  df['Returns'] = df['Close'].pct_change()
+  df['SMA_10'] = df['Close'].rolling(10).mean()
+  df['SMA_50'] = df['Close'].rolling(50).mean()
+  df['SMA_200'] = df['Close'].rolling(200).mean()
+  df['Volatility_20d'] = df['Returns'].rolling(20).std()
+  future_prices = pd.concat([df['Close'].shift(-i) for i in range(1, horizon+1)], axis=1)
+  future_avg = future_prices.mean(axis=1)
+  df['Direction'] = (future_avg > df['Close']).astype(int)
+  df = df.dropna()
+  closes = df['Close'].values
+  sma10 = df['SMA_10'].values
+  sma50 = df['SMA_50'].values
+  sma200 = df['SMA_200'].values
+  vol20 = df['Volatility_20d'].values
+  X_list = []
+  y_list = []
+  for i in range(lookback, len(df)):
+      if pd.isna(df['Direction'].iloc[i]):
+          continue
+      past_closes = closes[i - lookback:i].reshape(-1, 1)
+      final_sma10 = sma10[i]
+      final_sma50 = sma50[i]
+      final_sma200 = sma200[i]
+      final_vol20 = vol20[i]
+      indicators = np.array([final_sma10, final_sma50, final_sma200, final_vol20])
+      indicators_repeated = np.tile(indicators, (lookback, 1))
+      f_row = np.hstack([past_closes, indicators_repeated])
+      X_list.append(f_row)
+      y_list.append(df['Direction'].iloc[i])
+  X_all = np.array(X_list)
+  y_all = np.array(y_list)
+  valid_indices = np.arange(lookback, len(df))
+  data_for_XY = df.iloc[valid_indices].copy()
+  data_for_XY['Date'] = data_for_XY.index
+  data_for_XY.reset_index(drop=True, inplace=True)
+  return X_all, y_all, data_for_XY
+
+
+def load_data(stock):
+  end_date = forecast_date + dt.timedelta(days=future_days)
+  data = yf.download(stock, start=start_date, end=end_date)
+  data = data[['Close']].dropna()
+  return data
+
+
+def build_model(hp):
+  units = hp.Int('units', min_value=32, max_value=256, step=32)
+  dropout_rate = hp.Float('dropout_rate', 0.0, 0.4, step=0.1)
+  lr = hp.Choice('learning_rate', [1e-3, 1e-4])
+  model = Sequential()
+  model.add(Input(shape=(lookback, 5)))
+  model.add(SimpleRNN(units, activation='tanh', return_sequences=True))
+  model.add(Dropout(dropout_rate))
+  model.add(SimpleRNN(units, activation='tanh'))
+  model.add(Dropout(dropout_rate))
+  model.add(Dense(1, activation='sigmoid'))
+  model.compile(loss='binary_crossentropy', optimizer=Adam(lr), metrics=['accuracy'])
+  return model
+
+
+data_tune = load_data(stocks[0])
+X_tune, y_tune, df_tune = create_dataset(data_tune.copy(), horizon=5, lookback=lookback)
+if len(X_tune) == 0:
+  raise ValueError("Not enough data for tuning.")
+samples_train, timesteps, features = X_tune.shape
+X_tune_2d = X_tune.reshape(-1, features)
+scaler = StandardScaler()
+X_tune_2d_scaled = scaler.fit_transform(X_tune_2d)
+X_tune_scaled = X_tune_2d_scaled.reshape(samples_train, timesteps, features)
+tuner = kt.RandomSearch(
+  build_model,
+  objective='val_loss',
+  max_trials=5,
+  directory='my_dir',
+  project_name='rnn_tuning'
+)
+tuner.search(X_tune_scaled, y_tune, validation_split=0.2, epochs=10, batch_size=32, verbose=0)
+best_hp = tuner.get_best_hyperparameters(1)[0]
+units = best_hp.get('units')
+dropout_rate = best_hp.get('dropout_rate')
+lr = best_hp.get('learning_rate')
+for stock in stocks:
+  best_horizon = None
+  best_r2 = -999
+  best_results = None
+  data_main = load_data(stock)
+  for horizon in horizons:
+      X_all, y_all, data_for_XY = create_dataset(data_main.copy(), horizon, lookback)
+      if len(X_all)==0:
+          continue
+      all_dates = data_for_XY['Date']
+      if (all_dates >= pd.to_datetime(forecast_date)).any():
+          current_day_index = np.where(all_dates >= pd.to_datetime(forecast_date))[0][0]
+      else:
+          current_day_index = len(all_dates)-1
+      train_end = current_day_index
+      test_start = current_day_index
+      test_end = min(current_day_index+future_days, len(X_all))
+      if test_start <= 0 or test_start >= len(X_all):
+          continue
+      train_end_date = all_dates.iloc[train_end]
+      train_start_date = train_end_date - dt.timedelta(days=window_days)
+      train_start_idx_candidates = np.where(all_dates >= train_start_date)[0]
+      if len(train_start_idx_candidates)==0:
+          continue
+      train_start_idx = train_start_idx_candidates[0]
+      X_train = X_all[train_start_idx:train_end]
+      y_train = y_all[train_start_idx:train_end]
+      X_test = X_all[test_start:test_end]
+      y_test = y_all[test_start:test_end]
+      if len(X_train)==0 or len(X_test)==0:
+          continue
+      s_train, t_steps, f_count = X_train.shape
+      X_train_2d = X_train.reshape(-1, f_count)
+      X_test_2d = X_test.reshape(-1, f_count)
+      scaler_final = StandardScaler()
+      X_train_2d_scaled = scaler_final.fit_transform(X_train_2d)
+      X_train_scaled = X_train_2d_scaled.reshape(s_train, t_steps, f_count)
+      s_test = X_test.shape[0]
+      X_test_2d_scaled = scaler_final.transform(X_test_2d)
+      X_test_scaled = X_test_2d_scaled.reshape(s_test, t_steps, f_count)
+      model = Sequential()
+      model.add(Input(shape=(lookback, 5)))
+      model.add(SimpleRNN(units, activation='tanh'))
+      model.add(Dropout(dropout_rate))
+      model.add(Dense(1, activation='sigmoid'))
+      model.compile(loss='binary_crossentropy', optimizer=Adam(lr), metrics=['accuracy'])
+      model.fit(X_train_scaled, y_train, validation_split=0.2, epochs=EPOCHS, batch_size=BATCH_SIZE, verbose=0)
+      y_pred_proba = model.predict(X_test_scaled, verbose=0)
+      y_pred = (y_pred_proba > 0.5).astype(int).flatten()
+      acc = accuracy_score(y_test, y_pred)
+      f1 = f1_score(y_test, y_pred)
+      unique_classes = np.unique(y_test)
+      if len(unique_classes)<2:
+          auc = np.nan
+      else:
+          auc = roc_auc_score(y_test, y_pred)
+      if test_start > 0:
+          last_known_price = data_for_XY['Close'].iloc[test_start-1]
+      else:
+          last_known_price = data_for_XY['Close'].iloc[0]
+      sim_prices = [last_known_price]
+      for pred_dir in y_pred:
+          sim_prices.append(sim_prices[-1]*(1+0.005 if pred_dir==1 else 1-0.005))
+      sim_dates = all_dates.iloc[test_start:test_end]
+      actual_next = data_main[(data_main.index >= forecast_date) & (data_main.index <= forecast_date+dt.timedelta(days=future_days))]
+      common_ix = actual_next.index.intersection(sim_dates)
+      if len(common_ix)==0:
+          continue
+      actual_prices = actual_next.loc[common_ix]['Close'].values
+      predicted_prices = np.array(sim_prices[1:len(common_ix)+1])
+      mse = mean_squared_error(actual_prices, predicted_prices)
+      mae = mean_absolute_error(actual_prices, predicted_prices)
+      rmse = np.sqrt(mse)
+      r2 = r2_score(actual_prices, predicted_prices)
+      mape = np.mean(np.abs((actual_prices - predicted_prices)/actual_prices))*100 if np.all(actual_prices!=0) else np.nan
+      if len(actual_prices)>1 and len(predicted_prices)>1:
+          corr, _ = pearsonr(actual_prices, predicted_prices)
+      else:
+          corr = np.nan
+      actual_returns = np.diff(actual_prices)
+      predicted_returns = np.diff(predicted_prices)
+      direction_matches = np.sum((actual_returns * predicted_returns)>0)
+      direction_accuracy = direction_matches/len(actual_returns) if len(actual_returns)>0 else np.nan
+      if len(actual_next)>0:
+          start_actual = actual_next['Close'].iloc[0]
+          end_actual = actual_next['Close'].iloc[-1]
+          actual_change_pct = ((end_actual - start_actual)/start_actual)*100
+      else:
+          start_actual = np.nan
+          end_actual = np.nan
+          actual_change_pct = np.nan
+      if len(sim_prices)>1:
+          start_pred = sim_prices[1]
+          end_pred = sim_prices[-1]
+          pred_change_pct = ((end_pred - start_pred)/start_pred)*100
+      else:
+          start_pred = np.nan
+          end_pred = np.nan
+          pred_change_pct = np.nan
+      if not np.isnan(end_actual) and not np.isnan(end_pred):
+          diff_pct = ((end_pred - end_actual)/end_actual)*100
+      else:
+          diff_pct = np.nan
+      results = {
+          'horizon': horizon,
+          'acc': acc,
+          'f1': f1,
+          'auc': auc,
+          'mse': mse,
+          'mae': mae,
+          'rmse': rmse,
+          'r2': r2,
+          'mape': mape,
+          'corr': corr,
+          'direction_accuracy': direction_accuracy,
+          'start_actual': start_actual,
+          'end_actual': end_actual,
+          'actual_change_pct': actual_change_pct,
+          'start_pred': start_pred,
+          'end_pred': end_pred,
+          'pred_change_pct': pred_change_pct,
+          'diff_pct': diff_pct,
+          'sim_dates': sim_dates,
+          'sim_prices': sim_prices,
+          'actual_next': actual_next
+      }
+      print(f"[INFO] Horizon: {horizon} Days - R²: {r2:.2f}, ACC: {acc:.2f}")
+      if r2 > best_r2:
+          best_r2 = r2
+          best_horizon = horizon
+          best_results = results
+  if best_results is None:
+      print(f"No valid results for {stock}")
+      continue
+  diff_from_perfect = 1 - best_r2
+  print(f"\n=== {stock} Best Horizon: {best_horizon} days ===")
+  print(f"R²: {best_r2:.2f}, Difference from perfect (1 - R²): {diff_from_perfect:.2f}")
+  print("\nMetrics on the test (holdout):")
+  print(f"Accuracy: {best_results['acc']:.2f}, F1: {best_results['f1']:.2f}, AUC: {best_results['auc']:.2f}")
+  print("\nError Metrics for price predictions:")
+  print(f"MSE: {best_results['mse']:.2f}")
+  print(f"MAE: {best_results['mae']:.2f}")
+  print(f"RMSE: {best_results['rmse']:.2f}")
+  print(f"R²: {best_results['r2']:.2f}")
+  print(f"MAPE: {best_results['mape']:.2f}%")
+  print(f"Pearson Correlation: {best_results['corr']:.2f}")
+  print(f"Directional Accuracy: {best_results['direction_accuracy']:.2f}")
+  print("\nAdditional Metrics:")
+  print(f"Actual Start Price: {best_results['start_actual']:.2f}, Actual End Price: {best_results['end_actual']:.2f}, Actual % Change: {best_results['actual_change_pct']:.2f}%")
+  print(f"Predicted Start Price: {best_results['start_pred']:.2f}, Predicted End Price: {best_results['end_pred']:.2f}, Predicted % Change: {best_results['pred_change_pct']:.2f}%")
+  print(f"Difference between Actual and Predicted final price: {best_results['diff_pct']:.2f}%")
+  sim_dates = best_results['sim_dates']
+  sim_prices = best_results['sim_prices']
+  actual_next = best_results['actual_next']
+  plot_start_date = forecast_date - dt.timedelta(days=30)
+  data_f = yf.download(stock, start=start_date, end=forecast_date+dt.timedelta(days=future_days))
+  actual_past = data_f[(data_f.index >= plot_start_date) & (data_f.index < forecast_date)]
+  actual_next_segment = data_f[(data_f.index >= forecast_date) & (data_f.index <= forecast_date+dt.timedelta(days=future_days))]
+  plt.figure(figsize=(14,7))
+  plt.plot(actual_past.index, actual_past['Close'], label='Actual Prices (Last 30 days)', color='blue')
+  plt.plot(actual_next_segment.index, actual_next_segment['Close'], label='Actual Prices (Next 30 days)', color='green')
+  common_ix = actual_next_segment.index.intersection(sim_dates)
+  if len(common_ix) > 0:
+      num_predictions = len(common_ix)
+      if len(sim_prices)-1 > num_predictions:
+          sim_prices = sim_prices[:num_predictions+1]
+      plt.plot(common_ix, sim_prices[1:len(common_ix)+1], label='Predicted Direction-based Path', color='red', linestyle='--')
+  plt.title(f"Best Horizon for {stock}: {best_horizon} days\n(Last 30 days actual & Next {future_days} days predicted)")
+  plt.xlabel("Date")
+  plt.ylabel("Price")
+  plt.legend()
+  plt.show()
